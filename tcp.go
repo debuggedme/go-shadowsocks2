@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -134,7 +135,7 @@ func tcpRemote(addr string, shadow func(net.Conn) net.Conn) {
 			continue
 		}
 
-		clientIP := c.RemoteAddr().String()
+		clientIP := strings.Split(c.RemoteAddr().String(), ":")[0]
 		clientConnections.WithLabelValues(clientIP).Inc()
 
 		go func() {
