@@ -4,13 +4,33 @@ import (
 	"bufio"
 	"errors"
 	"io"
-	"io/ioutil"
 	"net"
+	"net/http"
 	"os"
 	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/shadowsocks/go-shadowsocks2/socks"
+)
+
+var (
+	clientConnections = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "shadowsocks_client_connections_total",
+			Help: "Total number of client connections",
+		},
+		[]string{"client"},
+	)
+	clientDataUsage = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "shadowsocks_client_receive_bytes_total",
+			Help: "Total data usage per client in bytes",
+		},
+		[]string{"client"},
+	)
 )
 
 // Create a SOCKS server listening on addr and proxy to server.
@@ -92,21 +112,30 @@ func tcpLocal(addr, server string, shadow func(net.Conn) net.Conn, getAddr func(
 	}
 }
 
+func startMetricsEndpoint() {
+	http.Handle("/metrics", promhttp.Handler())
+	go http.ListenAndServe(":2112", nil)
+}
+
 // Listen on addr for incoming connections.
 func tcpRemote(addr string, shadow func(net.Conn) net.Conn) {
+	startMetricsEndpoint()
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
 		logf("failed to listen on %s: %v", addr, err)
 		return
 	}
 
-	logf("listening TCP on %s", addr)
+	logf("listening TCP on %s, metrics on 2112", addr)
 	for {
 		c, err := l.Accept()
 		if err != nil {
 			logf("failed to accept: %v", err)
 			continue
 		}
+
+		clientIP := c.RemoteAddr().String()
+		clientConnections.WithLabelValues(clientIP).Inc()
 
 		go func() {
 			defer c.Close()
@@ -120,7 +149,7 @@ func tcpRemote(addr string, shadow func(net.Conn) net.Conn) {
 				logf("failed to get target address from %v: %v", c.RemoteAddr(), err)
 				// drain c to avoid leaking server behavioral features
 				// see https://www.ndss-symposium.org/ndss-paper/detecting-probe-resistant-proxies/
-				_, err = io.Copy(ioutil.Discard, c)
+				_, err = io.Copy(io.Discard, c)
 				if err != nil {
 					logf("discard error: %v", err)
 				}
@@ -134,12 +163,30 @@ func tcpRemote(addr string, shadow func(net.Conn) net.Conn) {
 			}
 			defer rc.Close()
 
+			sc = &dataCounterConn{Conn: sc, clientIP: clientIP}
 			logf("proxy %s <-> %s", c.RemoteAddr(), tgt)
 			if err = relay(sc, rc); err != nil {
 				logf("relay error: %v", err)
 			}
 		}()
 	}
+}
+
+type dataCounterConn struct {
+	net.Conn
+	clientIP string
+}
+
+func (d *dataCounterConn) Write(p []byte) (int, error) {
+	n, err := d.Conn.Write(p)
+	clientDataUsage.WithLabelValues(d.clientIP).Add(float64(n))
+	return n, err
+}
+
+func (d *dataCounterConn) Read(b []byte) (int, error) {
+	n, err := d.Conn.Read(b)
+	clientDataUsage.WithLabelValues(d.clientIP).Add(float64(n))
+	return n, err
 }
 
 // relay copies between left and right bidirectionally
