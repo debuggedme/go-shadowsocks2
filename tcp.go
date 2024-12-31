@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -18,17 +17,17 @@ import (
 )
 
 var (
-	clientConnections = promauto.NewCounterVec(
+	clientTransmit = promauto.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "shadowsocks_client_connections_total",
-			Help: "Total number of client connections",
+			Name: "shadowsocks_client_transmit_bytes_total",
+			Help: "Total data upload per client in bytes",
 		},
 		[]string{"client"},
 	)
-	clientDataUsage = promauto.NewCounterVec(
+	clientReceive = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "shadowsocks_client_receive_bytes_total",
-			Help: "Total data usage per client in bytes",
+			Help: "Total data download per client in bytes",
 		},
 		[]string{"client"},
 	)
@@ -135,9 +134,6 @@ func tcpRemote(addr string, shadow func(net.Conn) net.Conn) {
 			continue
 		}
 
-		clientIP := strings.Split(c.RemoteAddr().String(), ":")[0]
-		clientConnections.WithLabelValues(clientIP).Inc()
-
 		go func() {
 			defer c.Close()
 			if config.TCPCork {
@@ -164,7 +160,13 @@ func tcpRemote(addr string, shadow func(net.Conn) net.Conn) {
 			}
 			defer rc.Close()
 
-			sc = &dataCounterConn{Conn: sc, clientIP: clientIP}
+			ipAddr, _, err := net.SplitHostPort(c.RemoteAddr().String())
+			terr, ok := err.(*net.AddrError)
+			if ok && terr.Err == "missing port in address" {
+				ipAddr = c.RemoteAddr().String()
+			}
+
+			sc = &dataCounterConn{Conn: sc, clientIP: ipAddr}
 			logf("proxy %s <-> %s", c.RemoteAddr(), tgt)
 			if err = relay(sc, rc); err != nil {
 				logf("relay error: %v", err)
@@ -180,13 +182,13 @@ type dataCounterConn struct {
 
 func (d *dataCounterConn) Write(p []byte) (int, error) {
 	n, err := d.Conn.Write(p)
-	clientDataUsage.WithLabelValues(d.clientIP).Add(float64(n))
+	clientReceive.WithLabelValues(d.clientIP).Add(float64(n))
 	return n, err
 }
 
 func (d *dataCounterConn) Read(b []byte) (int, error) {
 	n, err := d.Conn.Read(b)
-	clientDataUsage.WithLabelValues(d.clientIP).Add(float64(n))
+	clientTransmit.WithLabelValues(d.clientIP).Add(float64(n))
 	return n, err
 }
 
